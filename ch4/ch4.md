@@ -122,19 +122,176 @@ spin lock
 - 0569코드 이해 다시
 
 
-To execute those two lines atomically, xv6 relies on a special x86 instruction, xchg (0569). 
+xchg
+---
+- xchg는 메모리에 있는 word를 레지스터의 내용과 바꾼다. 
+- 이 두줄의 atomic을 보장하기 위해 xchg를 사용한다. 
 
-In one atomic operation, xchg swaps a word in memory with the contents of a
-register. 
+acquire(1574)
+---
+- 루프에서 xchg를 반복
+- lk->lock을 1로(1581)
+- lock을 얻으면 디버깅을 위해 lock을 얻은 CPU 및 스택을 추적하여 기록한다. 
+    - 해제하지 않고 sleep대비
+- 디버깅 필드는 잠금을 유지하는 동안만 편집되어야 한다.(>???)
 
-The function acquire (1574) repeats this xchg instruction in a loop; each iteration atomically reads lk->locked and sets it to 1 (1581). 
+release(1602)
+---
+- 디버깅 필드를 지우고 잠금을 해제해야 됨
+- xchg는 ㅁ맞지 않다
+    - movl을 하면 바로 w인데 xchg는 rw기 때문??
+- 32bit의 movl이 4byte의 atomic 업데이트를 보장해준다. 
 
-If the lock is already held, lk->locked will already be 1, so the xchg returns 1 and the loop continues. 
 
-If the xchg returns 0, however, acquire has successfully acquired the lock—locked was 0 and is now 1—so the loop can stop. 
+xv6의 spinlock구현은 x86에만 한정되어 있으므로 다른 프로세서에 직접 사용불가하다. 따라서 C언어 기본 명령어 라이브러리를 지원함
+(Xv6’s implementation of spin-locks is x86-specific, and xv6 is thus not directly
+portable to other processors. To allow for portable implementations of spin-locks, the
+C language supports a library of atomic instructions; a portable operating system
+would use those instructions.)
 
-Once the lock is acquired, acquire records, for debugging, the CPU and stack trace that acquired the lock. 
+Code: Using locks
+====
+xv6는 race condition을 피하기 위해 여러가지 부분에서 lock을 사용한다. 
 
-If a process forgets to release a lock, this information can help to identify the culprit. 
+간단한 예로 IDE 드라이버(4200)이다.
 
-These debugging fields are protected by the lock and must only be edited while holding the lock.
+IDE driver
+---
+- 디스크 요청 대기열
+- 새로운 요청 수행
+
+이 두가지를 동시에 수행하기 위해 락을 사용한다. 
+드라이버의 목록과 다른 불변 조건을 보호하기 위해 iderw는 idelock을 획득하고 함수가 끝나면 해제한다. 
+
+idelock(4365)
+---
+- idestart
+    - if(idequeue == b) 인 경우 즉, 자신이 들어왔을때, queue에 다른 대기열이 없을 경우 디스크 작업을 수행한다. 
+- disk작업이 끝날때까지 프로세스는 sleep한다.
+    - 앞에 리쿼스트가 끝날때까지 sleep? or 자신이 끝날때까지 sleep?
+    - 둘다 여튼 안돔
+
+하지만 idestart에서도 b 다음에 달린 노드가 돌 수 있도록 작업 해주는 것처럼 보이지도 않고 그렇다면 while문에서 비트는 변하지 않고 무한 sleep이 일어날 것 같은데...
+
+lock을 사용하는데 어려운 부분은 얼마나 락을 사용할지와 데이터 및 불변량을 결정하는 것이다. 
+- 다른 CPU가 읽거나 쓸 수 있는 동시에 한 CPU에서 변수를 쓸 수 있는 경우 
+- 불변량이 여러 메모리 위치를 포함하는 경우 불변량을 유지하기 위해 모든 잠금이 단일 잠금으로 보호되어야 한다.
+
+lock이 불필요한 경우
+====
+병렬처리의 효율이 떨어지는 경우 lock을 사용하지 않고 단일 스레드를 사용한다. 
+
+간단한 커널은 다중 프로세서에서 커널에  들어갈때 lock을 하고 나갈때, release를 하여 수행한다. (파이프 읽기 또는 대기와 같은 시스템 호출이 문제를 일으키지만)
+
+이러한 방법은 한번에 하나의 CPU만 커널에서 실행할 수 있기 때문에 병렬처리에 희생이 발생한다.(여러 프로세서가 이런 대용량 커널 lock을 사용 -> 한번에 하나의 CPU만 실행 가능)
+
+커널이 계산량이 많은 경우 커널을 여러 CPU에서 동시에 실행할 수 있도록보다 세밀한 잠금 세트를 사용하는 것이 더 효율적이다. 
+
+
+Deadlock and lock ordering
+===
+여러개의 lock을 걸어야 할때 순서대로 lock을 획득해야 교착상태를 피할 수 있다. 
+- T1: A->B순서로 락 / T2: B->A순서로 락
+- 이러한 경우 때문에 락을 거는 순서는 맞춰주는게 편하다. 
+
+(Xv6은 ptable.lock과 관련된 길이가 2 인 많은 잠금 순서 체인을 가지고 있습니다. 예를 들어, ideintr은 idelock을 보유하고 있고 ptable 잠금을 획득하는 wakeup을 호출합니다. 파일 시스템 코드는 xv6에서 가장 긴 잠금 체인을 포함합니다. 예를 들어 파일을 만들려면 디렉토리에 대한 잠금, 새 파일의 inode에 대한 잠금, 디스크 블록 버퍼에 대한 잠금, idelock 및 ptable.lock을 동시에 보유해야합니다. 교착 상태를 피하기 위해 파일 시스템 코드는 항상 이전 문장에서 언급 한 순서대로 잠금을 획득합니다.)
+
+Interrupt handlers
+===
+xv6는 스핀락을 사용하여 interrupt 핸들러와 스레드가 모두 사용하는 데이터를 보호한다. 
+- 타이머 인터럽트는 커널 스레드가 sys_sleep(3823)에서 틱을 읽는 것과 거의 동시에 틱을 증가 시킬 수 있다.(3414) tickslock은 이 두가지 접근은 시리얼라이즈한다. 
+
+인터럽트는 단일 프로세서에서도 동시성을 유발할 수 있다. 인터럽트가 활성화되면 커널 코드를 중단하여 인터럽트 핸들러를 대신 실행 할 수 있다.
+
+iderw를 잡고 ideintr을 실행하기 위해 중단 된 경우
+- ideintr은 idelock을 잡으려고 했으나 그것이 이미 잡혀있는 상황에서 그것은 release되기를 기다린다. 
+- 이 상황에서 idelock은 해제되지 않은 것이다. 오로직 iderw만이 release가 가능하고 iderw는 ideintr이 반환하기 전까진 돌지 않을 것이다. 그러므로 교착상태가 발생한다. 
+    - 이런 상황을 피하기 위해 인터럽트 핸들러에 의해 활성화 된 상태에서 절대로 해당 lock을 보유해서는 안된다. 
+    - 스핀 락이 critical section에 진입할 경우 xv6는 해당 프로세서에서 인터럽트가 비활성화 되도록해야 한다. 
+    - 인터럽트는 다른 프로세서에서 여전히 발생가능하므로 인터럽트의 획득은 스레드가 스핀락을 해제할때까지 대기할 수 있다;just not on the same processor
+
+(??)
+
+프로세서가 스핀락을 가지고 있지 않을 때는 다시 인터럽트를 활성화 하여야 하기때문에  중첩된 락의 갯수를 관리 해야 한다. 
+- pushcli(1667)
+    - 
+- popcli(1679)
+    - 
+
+카운트가 0에 도달하면 인터럽트를 다시 활성화 상태로 복구한다. 
+cli 및 sti함수는 각각 x86 인터럽트 비활성화 및 실행 명령어를 실행함
+
+락을 획득할때 xchg이전에 pushcli를 얻고 popcli이후 release하는 것이 중요하다.(1581) 순서가 바꿘경우 락이 걸린 상태에서 다시 인터럽트 요청이 들어와 교착상태를 이르킬 수 있다. 
+
+Instruction and memory ordering
+====
+여기서는 코드가 순서대로 실행한다고 가정
+- 사실 컴파일러는 성능을 높이기 위해 순서대로 실행 안함.
+- 인스트럭션 완료가 오래걸리는 경우 다른 인스트럭션와 섞어서 실행하려함
+    - instruction A, B가 디펜던시가 없으면 B를 A보다 먼저 실행하여 프로세서가 A를 완료할때 B도 같이 완료 되도록
+
+그러나 동시성은 이런 스케줄링을 소프트웨어에 노출시켜 부정확한 행동을 유도할 수 있다. 
+- 예를 들면 컴파일러가 다음 코드에서 release이후로 4, 5줄 코드를 재배치 한 경우
+    - 이경우 race condition을 유발하는 코드가 lock으로 보호 받지 못하게 된다. 
+
+__sync_synchronize
+---
+- acquire, release에서 사용하는데 이는 컴파일러와 CPU가 loads와 restores를 보호벽을 가로질러서 재배치하는 것을 막는다. 
+
+- acquire과 release사이에서만 데이터의 동시 접근이 일어나기 때문에 이에 대하여만 처리해주면된다. 
+
+Sleep locks
+===
+때로는 xv6는 락을 오래 유지해야 되는 경우가 있다. 이런 경우에 다른 스레드가 진행할 수 있도록 프로세서가 yield를 해야 한다는 것을 의미한다. 이는 xv6가 컨택스트 스이치를 통해 보유 될때 xv6가 잘 동작하는 lock이 필요함을 의미한다. 
+
+xv6는 이러한 lock을 sleep lock으로 제공한다. 
+
+sleep lock은 중요한 criticial section에서 yielding을 제공한다. 
+- 문제점: T1이 L을 잡고 슬립할 때, T2가 L을 획득하고자 한담면 T1이 L을 release할 수 있도록 T2가 대기하는 동안 T1을 실행 할 수 있어야 함
+- T2는 여기서 스핀락의 acquire를 사용할 수 없다 이는 T1으로 하여금 인터럽트가 꺼진 상태로 회전하여 실행되지 않도록 한다. 
+- 이 교착상태를 피하기 위해 sleeplock acquire 루틴은 기다리는 동안 프로세서를 포기하고 인터럽트를 비활성화하지 않는다.  
+
+
+acquiresleep(4622)
+---
+하이 래벨에서 슬립락은 스핀락에 의해 보호되는 부분이 있으며 acquiresleep의 sleep 호출은 atomic하게 CPU를 포기하고 스핀락을 해제한다. 
+
+결과적으로 acquiresleep을 호출하는동안 다른 스레드가 실행 가능하게 된다. 
+
+슬립락은 인터럽트를 활성화 된 상태로 유지하기 때문에 인터럽트 핸들러에서 사용할 수 없다. 
+
+acquiresleep은 프로세서를 yield할 수 있기 때문에 sleep락은 스핀락 내부에 쓰일 수 없다. 
+- spin락도 잡고 잠수타는 꼴이 되니까
+
+xv6에서는 대부분 오버 해드가 적어 스핀락을 사용하고 오로지 디스크작업에서만 슬립락을 사용한다. 
+
+
+
+
+Limitations of locks
+===
+락은 동시성을 해결하지만 가끔 문제가 있는 경우가 있다. 
+- 간혹 lock에 의해 보호받아야 하는 데이터를 사용하는 함수가 락이 필요한 곳에서 호출될 수도 있고 필요 없는 곳에서 호출 될 수도 있다. 
+    - 이 문제를 해결하기 위한 방법은 함수의 두 variants를 갖는 것이다, 하나는 락을 획득하는 것이고 나머지는 이미 락을 잡고있는 들어오는 경우이다. 
+        - eg.)2953
+
+********* 여기 아래로 부정확한 해석 ******
+
+
+It might seem that one could simplify situations where both caller and callee need a lock by allowing recursive locks, so that if a function holds a lock, any function it calls is allowed to re-acquire the lock.
+
+그러나 프로그래머는 caller와 callee모든 조합에 대해서 생각해야된다. 
+- 더 이상 데이터 구조의 불변 조건이 acquire이후 항상 만족하는 것이 아니게 되었기 때문이다. 
+
+xv6에서 락을 유지해야하는 함수에 대한 규칙을 사용하는 것보다 재귀 락을 사용하는 것이 더 나은지는 명확 하지 않다. 
+
+교착 상태를 피하기 위해서 전역 락 순서와 마찬가지로 락 요구 사항은 종종 private이 될 수 없느나 함수 및 모듈의 인터페이스에 침입한다는 것이다. 
+
+락이 충분하지 않은 경우는 하나의 thread가 작업하는 동안 다른 thread가 기다려야 하는 경우이다. 
+- 대기중인 스레드는 대기중인 업데이트를 방지하기 때문에 데이터에 대한 잠금을 유지할 수 없다. 
+
+
+질문
+===
+- 왜 인터럽트 도중에 인터럽트를 받으면 안되는지를 모르겠음
+- acquiresleep(4622) --> 어떻게 돌아가는지 모르겠네
